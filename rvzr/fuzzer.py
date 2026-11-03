@@ -758,7 +758,7 @@ class Fuzzer:
 
     @staticmethod
     def _create_timestamped_dir(path: str) -> str:
-        timestamp = datetime.today().strftime('%y%m%d-%H%M%S')
+        timestamp = datetime.today().strftime('%y%m%d-%H%M%S-%f')
         violation_dir = f"{path}/violation-{timestamp}"
         Path(path).mkdir(exist_ok=True)
         Path(violation_dir).mkdir()
