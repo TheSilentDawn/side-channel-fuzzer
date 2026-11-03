@@ -148,8 +148,18 @@ def _read_trace(n_reps: int,
         reading_finished: bool = False
         while not reading_finished:
             # read the next batch of traces from the kernel module
-            output = subprocess.check_output(
-                f"taskset -c {CONF.executor_taskset} cat /sys/rvzr_executor/trace", shell=True)
+            try:
+                output = subprocess.check_output(
+                    f"taskset -c {CONF.executor_taskset} cat /sys/rvzr_executor/trace", shell=True)
+            except subprocess.CalledProcessError as e:
+                # A transient NMI/SMI during a measurement makes the kernel module return EIO.
+                # The original code let this abort the whole campaign; treat it as a corrupted
+                # measurement so that Fuzzer._normal_stage can skip this test case.
+                try:
+                    _rewind_km_output_to_end()
+                except Exception:
+                    pass
+                raise IOError("executor kernel module returned an error") from e
             lines = output.decode().split("\n")
 
             # parse the output

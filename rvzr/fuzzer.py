@@ -524,7 +524,14 @@ class Fuzzer:
                 continue
 
             # Fuzz the test case
-            violation = self.fuzzing_round(test_case, inputs, [])
+            try:
+                violation = self.fuzzing_round(test_case, inputs, [])
+            except OSError as e:
+                # The executor can reject a malformed/unsupported test case with EIO, or a
+                # transient NMI can corrupt a measurement. Skip this test case instead of
+                # aborting the whole campaign.
+                warning("fuzzer", f"Skipping test case after executor error: {e}")
+                continue
             if violation:
                 self.log.report_violations(violation)
                 self.log.dbg_violation(violation, self.model)
