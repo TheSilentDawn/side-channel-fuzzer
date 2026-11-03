@@ -259,8 +259,27 @@ class _RoundManager:
 
     def _collect_htraces(self) -> None:
         """ Collect hardware traces for the boosted inputs """
-        new_htraces = self.fuzzer.executor.trace_test_case(self.boosted_inputs,
-                                                           self.conf.executor_n_reps)
+        if (CONF.enable_adaptive_sampling and self.conf.is_initial
+                and not self.conf.extend_htraces
+                and self.conf.executor_n_reps > CONF.adaptive_initial_samples):
+            from .measurement_controller import MeasurementController
+            controller = MeasurementController(
+                self.fuzzer.executor, self.fuzzer.analyser,
+                self.conf.executor_n_reps, CONF.adaptive_initial_samples,
+                CONF.adaptive_audit_rate)
+            new_htraces = controller.collect(self.boosted_inputs, self.ctraces)
+            if controller.last_audit_missed and CONF.adaptive_missed_dir:
+                import os as _os
+                _os.makedirs(CONF.adaptive_missed_dir, exist_ok=True)
+                idx = len(_os.listdir(CONF.adaptive_missed_dir))
+                d = _os.path.join(CONF.adaptive_missed_dir, f"missed_{idx:04d}")
+                _os.makedirs(d, exist_ok=True)
+                self.test_case.save(_os.path.join(d, "program.asm"))
+                for j, inp in enumerate(self.boosted_inputs):
+                    inp.save(_os.path.join(d, f"input_{j:04d}.bin"))
+        else:
+            new_htraces = self.fuzzer.executor.trace_test_case(
+                self.boosted_inputs, self.conf.executor_n_reps)
         if not self.conf.extend_htraces:
             self.htraces = new_htraces
             return

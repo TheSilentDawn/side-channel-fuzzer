@@ -31,6 +31,12 @@ class FuzzingStats:
     fp_early_priming: int = 0
     fp_large_sample: int = 0
     fp_priming: int = 0
+    adaptive_early_stop: int = 0
+    adaptive_escalate: int = 0
+    adaptive_audit: int = 0
+    adaptive_pfc_escalate: int = 0
+    adaptive_audit_missed: int = 0
+    adaptive_samples_saved: int = 0
 
     # Implementation of Borg pattern
     def __init__(self) -> None:
@@ -60,6 +66,14 @@ class FuzzingStats:
         s += f"  Early Priming Check: {self.fp_early_priming}\n"
         s += f"  Large Sample Check: {self.fp_large_sample}\n"
         s += f"  Priming Check: {self.fp_priming}\n"
+        if self.adaptive_early_stop or self.adaptive_escalate or self.adaptive_audit:
+            s += "Adaptive Sampling:\n"
+            s += f"  Early Stop: {self.adaptive_early_stop}\n"
+            s += f"  Escalated: {self.adaptive_escalate}\n"
+            s += f"  PFC-triggered escalation: {self.adaptive_pfc_escalate}\n"
+            s += f"  Audited: {self.adaptive_audit}\n"
+            s += f"  Audit found missed candidate: {self.adaptive_audit_missed}\n"
+            s += f"  Samples Saved: {self.adaptive_samples_saved}\n"
         return s
 
     def get_brief(self) -> str:

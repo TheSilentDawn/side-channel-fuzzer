@@ -258,6 +258,14 @@ class Conf:
     executor_taskset: int = 0
     """ executor_taskset: id of the CPU core on which the executor is running test cases """
     enable_pre_run_flush: bool = True
+    enable_adaptive_sampling: bool = False
+    """ enable_adaptive_sampling: use the SeqRev prefix sampling controller on the fast path """
+    adaptive_initial_samples: int = 5
+    """ adaptive_initial_samples: number of hardware samples collected before the stop decision """
+    adaptive_audit_rate: float = 0.0
+    adaptive_pfc_abs_threshold: float = 0.5
+    adaptive_missed_dir: str = ""
+    """ adaptive_audit_rate: fraction of clean-prefix rounds that are nevertheless fully sampled """
     """ enable_pre_run_flush: if enabled, the executor will do its best to flush
     the microarchitectural state before running test cases """
 
