@@ -264,6 +264,8 @@ class Conf:
     """ adaptive_initial_samples: number of hardware samples collected before the stop decision """
     adaptive_audit_rate: float = 0.0
     adaptive_pfc_abs_threshold: float = 0.5
+    adaptive_pfc_rel_threshold: float = -1.0
+    adaptive_trigger_mode: str = "support"
     adaptive_missed_dir: str = ""
     """ adaptive_audit_rate: fraction of clean-prefix rounds that are nevertheless fully sampled """
     """ enable_pre_run_flush: if enabled, the executor will do its best to flush
@@ -350,6 +352,7 @@ class Conf:
         ],
         "analyser": ["bitmaps", "sets", "mwu", "chi2"],
         "coverage_type": ["none", "model_instructions"],
+        "adaptive_trigger_mode": ["support", "support+frequency"],
         "logging_modes": [
             "info",
             "stat",
