@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 STAT = FuzzingStats()
 _ROUND_COUNTER = 0
+_ELIGIBLE_COUNTER = 0
 _DEBUG_LOG = os.environ.get("RVZR_ADAPTIVE_LOG", "")
 
 
@@ -85,8 +86,11 @@ class MeasurementController:
             STAT.adaptive_pfc_escalate += 1
         audit = False
         if not needs_more:
+            global _ELIGIBLE_COUNTER
+            audit_index = _ELIGIBLE_COUNTER
+            _ELIGIBLE_COUNTER += 1
             STAT.adaptive_audit_eligible += 1
-            audit = audit_decision(CONF.data_generator_seed, round_id, self._audit_rate)
+            audit = audit_decision(CONF.data_generator_seed, audit_index, self._audit_rate)
 
         if not needs_more and not audit:
             STAT.adaptive_early_stop += 1
@@ -108,9 +112,11 @@ class MeasurementController:
             if full_has_diff:
                 STAT.adaptive_audit_missed += 1
                 self.last_audit_missed = True
+        audit_index = locals().get("audit_index", -1)
         if _DEBUG_LOG:
             with open(_DEBUG_LOG, "a") as f:
-                f.write(json.dumps({"round": round_id, "n_inputs": len(inputs),
+                f.write(json.dumps({"round": round_id, "audit_index": audit_index,
+                                    "n_inputs": len(inputs),
                                     "n_initial": self._n_initial, "max_distinct": max_distinct,
                                     "multi_inputs": multi_inputs, "needs_more": needs_more,
                                     "trace_diff": trace_diff, "support_diff": support_diff,
