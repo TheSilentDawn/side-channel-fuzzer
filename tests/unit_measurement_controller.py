@@ -155,6 +155,16 @@ class MeasurementControllerTest(unittest.TestCase):
         self.assertEqual(stat.adaptive_samples_saved - before, 16)
         self.assertEqual(stat.adaptive_repetition_rounds_saved - reps_before, 8)
 
+    def test_corrupted_trace_escalates(self):
+        ct = [CTrace([CTraceEntry("val", 0)])] * 2
+        low = [HTrace.invalid_trace(), make_htrace([5])]
+        high = [make_htrace([5] * 9), make_htrace([5] * 9)]
+        ex = FakeExecutor([low, high])
+        c = MeasurementController(ex, None, n_total=10, n_initial=1)
+        out = c.collect([object(), object()], ct)
+        self.assertEqual(ex.calls, 2)
+        self.assertEqual([h.sample_size() for h in out], [10, 10])
+
     def test_no_escalation_when_different_classes_differ(self):
         ct = [CTrace([CTraceEntry("val", 0)]), CTrace([CTraceEntry("val", 1)])]
         low = [make_htrace([5, 5]), make_htrace([7, 7])]
