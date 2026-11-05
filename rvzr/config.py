@@ -266,6 +266,10 @@ class Conf:
     adaptive_pfc_abs_threshold: float = 0.5
     adaptive_pfc_rel_threshold: float = -1.0
     adaptive_trigger_mode: str = "support"
+    adaptive_staging: str = "fixed"
+    """ adaptive_staging: fixed (n_initial -> n_total) | staged (progressive boundaries) """
+    adaptive_stage_sizes: List[int] = [7]
+    """ adaptive_stage_sizes: intermediate sample counts used when adaptive_staging=staged """
     adaptive_missed_dir: str = ""
     """ adaptive_audit_rate: fraction of clean-prefix rounds that are nevertheless fully sampled """
     """ enable_pre_run_flush: if enabled, the executor will do its best to flush
@@ -353,6 +357,7 @@ class Conf:
         "analyser": ["bitmaps", "sets", "mwu", "chi2"],
         "coverage_type": ["none", "model_instructions"],
         "adaptive_trigger_mode": ["support", "support+frequency"],
+        "adaptive_staging": ["fixed", "staged"],
         "logging_modes": [
             "info",
             "stat",

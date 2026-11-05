@@ -33,16 +33,20 @@ class MeasurementControllerTest(unittest.TestCase):
     def setUp(self):
         self._old = (CONF.enable_adaptive_sampling, CONF.adaptive_pfc_abs_threshold,
                      CONF.adaptive_pfc_rel_threshold, CONF.adaptive_trigger_mode,
-                     CONF.adaptive_audit_rate)
+                     CONF.adaptive_audit_rate, CONF.adaptive_staging,
+                     tuple(CONF.adaptive_stage_sizes))
         CONF.adaptive_pfc_abs_threshold = 0.5
         CONF.adaptive_pfc_rel_threshold = -1.0
         CONF.adaptive_trigger_mode = "support"
         CONF.adaptive_audit_rate = 0.0
+        CONF.adaptive_staging = "fixed"
+        CONF.adaptive_stage_sizes = [7]
 
     def tearDown(self):
         (CONF.enable_adaptive_sampling, CONF.adaptive_pfc_abs_threshold,
          CONF.adaptive_pfc_rel_threshold, CONF.adaptive_trigger_mode,
-         CONF.adaptive_audit_rate) = self._old
+         CONF.adaptive_audit_rate, CONF.adaptive_staging) = self._old[:6]
+        CONF.adaptive_stage_sizes = list(self._old[6])
 
     def test_early_stop_when_prefix_is_identical(self):
         ct = [CTrace([CTraceEntry("val", 0)])] * 2
@@ -154,6 +158,48 @@ class MeasurementControllerTest(unittest.TestCase):
         c.collect([object(), object()], ct)
         self.assertEqual(stat.adaptive_samples_saved - before, 16)
         self.assertEqual(stat.adaptive_repetition_rounds_saved - reps_before, 8)
+
+    def test_staged_mode_stops_at_last_boundary_when_clean(self):
+        # clean at 5 and at 7 -> keep 7 samples, never reach 10
+        CONF.adaptive_staging = "staged"
+        CONF.adaptive_stage_sizes = [7]
+        ct = [CTrace([CTraceEntry("val", 0)])] * 2
+        b1 = [make_htrace([5, 5, 5, 5, 5]), make_htrace([5, 5, 5, 5, 5])]
+        b2 = [make_htrace([5, 5]), make_htrace([5, 5])]
+        ex = FakeExecutor([b1, b2])
+        c = MeasurementController(ex, None, n_total=10, n_initial=5)
+        out = c.collect([object(), object()], ct)
+        self.assertEqual(ex.calls, 2)
+        self.assertEqual([h.sample_size() for h in out], [7, 7])
+
+    def test_staged_mode_escalates_at_second_stage(self):
+        # samples 1-5 identical; samples 6-7 introduce a difference
+        CONF.adaptive_staging = "staged"
+        CONF.adaptive_stage_sizes = [7]
+        ct = [CTrace([CTraceEntry("val", 0)])] * 2
+        b1 = [make_htrace([5, 5, 5, 5, 5]), make_htrace([5, 5, 5, 5, 5])]
+        b2 = [make_htrace([5, 5]), make_htrace([5, 6])]  # -> 7 samples, differ
+        b3 = [make_htrace([5, 5, 5]), make_htrace([5, 5, 5])]
+        ex = FakeExecutor([b1, b2, b3])
+        c = MeasurementController(ex, None, n_total=10, n_initial=5)
+        out = c.collect([object(), object()], ct)
+        self.assertEqual(ex.calls, 3)  # 5, then +2 (=7, now differs), then +3 (=10)
+        self.assertEqual([h.sample_size() for h in out], [10, 10])
+
+    def test_staged_mode_misses_leak_visible_only_after_last_boundary(self):
+        # a leak that first appears at sample 8 is NOT caught by staged-7: the round
+        # stops at the last boundary.  This is the documented recall trade-off that
+        # must be quantified on hardware (detection at 7 vs 10).
+        CONF.adaptive_staging = "staged"
+        CONF.adaptive_stage_sizes = [7]
+        ct = [CTrace([CTraceEntry("val", 0)])] * 2
+        b1 = [make_htrace([5] * 5), make_htrace([5] * 5)]
+        b2 = [make_htrace([5, 5]), make_htrace([5, 5])]      # clean at 7
+        ex = FakeExecutor([b1, b2])
+        c = MeasurementController(ex, None, n_total=10, n_initial=5)
+        out = c.collect([object(), object()], ct)
+        self.assertEqual(ex.calls, 2)
+        self.assertEqual([h.sample_size() for h in out], [7, 7])
 
     def test_corrupted_trace_escalates(self):
         ct = [CTrace([CTraceEntry("val", 0)])] * 2

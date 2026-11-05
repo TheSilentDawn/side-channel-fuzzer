@@ -69,6 +69,10 @@ class MeasurementController:
         if self._n_total <= self._n_initial:
             return self._executor.trace_test_case(list(inputs), self._n_total)
 
+        staging = getattr(CONF, "adaptive_staging", "fixed")
+        if staging == "staged":
+            return self._collect_staged(inputs, ctraces, round_id)
+
         low = self._executor.trace_test_case(list(inputs), self._n_initial)
         max_distinct = max(len(set(int(x) for x in h.get_raw_traces())) for h in low)
         multi_inputs = sum(1 for h in low
@@ -126,6 +130,68 @@ class MeasurementController:
                                     "full_freq_diff": full_freq_diff,
                                     **pfc_stats}) + "\n")
         return merged
+
+    def _collect_staged(self, inputs: Sequence['InputData'],
+                        ctraces: Sequence['CTrace'], round_id: int) -> List['HTrace']:
+        """Progressive sampling: walk intermediate boundaries while clean, jump to
+        the full budget only when a trigger fires.
+
+        Boundaries are [n_initial] + adaptive_stage_sizes (e.g. 5 -> 7).  A round that
+        stays clean through every boundary keeps only those samples (7), which is more
+        than the fixed controller's 5 and therefore catches leaks that surface by the
+        last boundary.  Any trigger (support/frequency/PFC) escalates straight to
+        ``n_total`` because a candidate needs the full confirmation budget.
+        """
+        boundaries = sorted({int(x) for x in [self._n_initial]
+                             + list(CONF.adaptive_stage_sizes)
+                             if 0 < int(x) < self._n_total})
+        mode = getattr(CONF, "adaptive_trigger_mode", "support")
+        pfc_abs = getattr(CONF, "adaptive_pfc_abs_threshold", 0.5)
+        pfc_rel = getattr(CONF, "adaptive_pfc_rel_threshold", -1.0)
+
+        def _trigger(htraces):
+            support_diff, freq_diff = self._difference_flags(htraces, ctraces)
+            trace_diff = support_diff if mode == "support" else (support_diff or freq_diff)
+            pfc_stats = self._pfc_difference_stats(htraces, ctraces)
+            pfc_escalate = ((pfc_abs >= 0 and pfc_stats["pfc_max_abs"] > pfc_abs)
+                            or (pfc_rel >= 0 and pfc_stats["pfc_max_rel"] > pfc_rel))
+            return trace_diff or pfc_escalate, trace_diff, pfc_stats
+
+        samples = self._executor.trace_test_case(list(inputs), boundaries[0])
+        n_have = boundaries[0]
+        escalated = False
+        for stage_id, target in enumerate(boundaries[1:], start=1):
+            fired, _, _ = _trigger(samples)
+            if fired:
+                break
+            extra = self._executor.trace_test_case(list(inputs), target - n_have)
+            samples = [h.merge(x) for h, x in zip(samples, extra)]
+            n_have = target
+            STAT.adaptive_stage_entries[stage_id] = \
+                STAT.adaptive_stage_entries.get(stage_id, 0) + 1
+
+        fired, trace_diff, pfc_stats = _trigger(samples)
+        if fired:
+            escalated = True
+            if n_have < self._n_total:
+                extra = self._executor.trace_test_case(list(inputs), self._n_total - n_have)
+                samples = [h.merge(x) for h, x in zip(samples, extra)]
+                n_have = self._n_total
+
+        if escalated:
+            STAT.adaptive_escalate += 1
+        else:
+            STAT.adaptive_early_stop += 1
+            STAT.adaptive_samples_saved += (self._n_total - n_have) * len(inputs)
+            STAT.adaptive_repetition_rounds_saved += self._n_total - n_have
+        if _DEBUG_LOG:
+            with open(_DEBUG_LOG, "a") as f:
+                f.write(json.dumps({
+                    "round": round_id, "staged": True, "boundaries": boundaries,
+                    "n_samples": n_have, "escalated": escalated,
+                    "final_trace_diff": trace_diff, "final_pfc": pfc_stats,
+                    "n_inputs": len(inputs)}) + "\n")
+        return samples
 
     @staticmethod
     def _pfc_difference_stats(htraces: Sequence['HTrace'], ctraces: Sequence['CTrace']) -> dict:

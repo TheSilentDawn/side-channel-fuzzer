@@ -40,6 +40,7 @@ class FuzzingStats:
     adaptive_audit_missed: int = 0
     adaptive_samples_saved: int = 0
     adaptive_repetition_rounds_saved: int = 0
+    adaptive_stage_entries: Dict[int, int] = {}
 
     # Implementation of Borg pattern
     def __init__(self) -> None:
@@ -79,6 +80,9 @@ class FuzzingStats:
             s += f"  Audit found missed candidate: {self.adaptive_audit_missed}\n"
             s += f"  Hardware samples saved (input x rep): {self.adaptive_samples_saved}\n"
             s += f"  Repetition rounds saved: {self.adaptive_repetition_rounds_saved}\n"
+            if self.adaptive_stage_entries:
+                s += "  Stage entries: " + \
+                    ", ".join(f"stage{k}={v}" for k, v in sorted(self.adaptive_stage_entries.items())) + "\n"
         return s
 
     def get_brief(self) -> str:
