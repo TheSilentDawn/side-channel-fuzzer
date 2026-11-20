@@ -11,11 +11,12 @@ import subprocess
 import os
 from pathlib import Path
 from copy import deepcopy
+from unittest.mock import patch
 
 from rvzr.arch.x86.generator import X86Generator, _X86Printer, _X86PatchUndefinedFlagsPass, \
     _X86PatchOpcodesPass
 from rvzr.arch.x86.target_desc import X86TargetDesc
-from rvzr.elf_parser import ELFParser, _ParsingError
+from rvzr.elf_parser import ELFParser, _ObjdumpOutputParser, _ParsingError
 from rvzr.factory import get_program_generator, get_asm_parser
 from rvzr.isa_spec import InstructionSet
 from rvzr.tc_components.actor import ActorMode
@@ -227,6 +228,19 @@ nop
         asm = self._opcode_test_asm("0xd5, 0x90")
         with self.assertRaises(_ParsingError):
             self.load_tc(asm)
+
+    def test_x86_misaligned_function_offset_is_parsing_error(self) -> None:
+        """Offset validation must survive python -O (no assert)."""
+        original = _ObjdumpOutputParser.parse
+
+        def shifted(self, obj_file):
+            result = original(self, obj_file)
+            result["main"] = [address + 1 for address in result["main"]]
+            return result
+
+        with patch.object(_ObjdumpOutputParser, "parse", shifted):
+            with self.assertRaises(_ParsingError):
+                self.load_tc(ASM_OPCODE)
 
     def test_x86_asm_parsing_section(self) -> None:
         prev_actors = deepcopy(CONF.get_actors_conf())

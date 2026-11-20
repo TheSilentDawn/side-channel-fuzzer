@@ -285,8 +285,12 @@ class ELFParser:
                         f"section '{section_data['name']}' has {len(section_addresses)} "
                         f"instructions, but function '{func_data['name']}' starts at "
                         f"cursor {cursor}")
-                assert func_data["offset"] == section_addresses[cursor], \
-                    f"offsets: {func_data['offset']} {section_addresses[cursor]}"
+                if func_data["offset"] != section_addresses[cursor]:
+                    raise _ParsingError(
+                        f"section '{section_data['name']}': function "
+                        f"'{func_data['name']}' offset {func_data['offset']} does not "
+                        f"match instruction address {section_addresses[cursor]} at "
+                        f"cursor {cursor}")
 
                 for bb in list(function_object) + [function_object.get_exit_bb()]:
                     for inst in list(bb) + bb.terminators:
