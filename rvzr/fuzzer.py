@@ -560,6 +560,7 @@ class Fuzzer:
         prepared_queue = None
         stop_event = None
         if use_pipeline:
+            from .pipeline import ProducerFailure, restore_prefetched_state
             if CONF.pipeline_use_process:
                 import multiprocessing
                 from .pipeline import ProcessRoundProducer
@@ -615,6 +616,8 @@ class Fuzzer:
                             raise producer.error
                         raise RuntimeError("round producer stalled")
                     _wait = (time.perf_counter() - _tget) * 1000
+                    if isinstance(prepared, ProducerFailure):
+                        raise prepared.to_exception()
                     if prepared is None:
                         if producer.error:
                             raise producer.error
@@ -625,7 +628,6 @@ class Fuzzer:
                     # Confirmation must re-boost from this round's RNG state,
                     # matching the synchronous generator. The producer owns a
                     # separate generator and may already be several rounds ahead.
-                    from .pipeline import restore_prefetched_state
                     restore_prefetched_state(self.data_gen, prepared)
                 else:
                     test_case = self._generation_function(self._existing_test_case)

@@ -10,7 +10,7 @@ from rvzr.config import CONF
 from rvzr.data_generator import DataGenerator
 from rvzr.fuzzer import _RoundManager
 from rvzr import pipeline as pipeline_module
-from rvzr.pipeline import PreparedRound, restore_prefetched_state
+from rvzr.pipeline import PreparedRound, ProducerFailure, restore_prefetched_state
 from rvzr.tc_components.test_case_data import InputTaint
 from rvzr.traces import HTrace, RawHTraceSample
 
@@ -96,31 +96,66 @@ class IntegratedTests(unittest.TestCase):
         finally:
             CONF.enable_forced_split = old
 
-    def test_process_producer_propagates_child_exception(self):
-        class FailingRoundProducer:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            def run(self):
-                raise IndexError("intentional child failure")
-
+    def _run_isolated_producer(self, producer_cls, max_rounds, expected_items):
         original = pipeline_module.RoundProducer
-        pipeline_module.RoundProducer = FailingRoundProducer
+        pipeline_module.RoundProducer = producer_cls
         ctx = multiprocessing.get_context("fork")
-        out_queue = ctx.Queue(maxsize=2)
+        out_queue = ctx.Queue(maxsize=4)
         stop_event = ctx.Event()
         producer = pipeline_module.ProcessRoundProducer(
             str(Path(__file__).parent / "x86_tests" / "min_x86.json"),
-            (0, 0, 0, 0), 1, "/tmp/unused-prefix", 1, out_queue, stop_event)
+            (0, 0, 0, 0), 1, "/tmp/unused-prefix", max_rounds, out_queue, stop_event)
         try:
             producer.start()
+            items = [out_queue.get(timeout=5) for _ in range(expected_items)]
             producer.join(timeout=5)
-            error = producer.error
-            self.assertIsNotNone(error)
-            self.assertIn("IndexError", str(error))
-            self.assertIn("intentional child failure", str(error))
+            return items, producer
         finally:
             pipeline_module.RoundProducer = original
+
+    @staticmethod
+    def _isolated_producer_class(prepare):
+        class IsolatedProducer(pipeline_module.RoundProducer):
+            def __init__(self, isa, bases, num_inputs, asm_prefix, max_rounds,
+                         out_queue, stop_event):
+                # Keep the real RoundProducer.run(); only bypass model setup.
+                self._max_rounds = max_rounds
+                self._queue = out_queue
+                self._stop_event = stop_event
+                self.error = None
+                self._error_traceback = ""
+                self.produced = 0
+
+            def _prepare(self, i):
+                return prepare(i)
+
+        return IsolatedProducer
+
+    def test_process_producer_propagates_prepare_exception(self):
+        def prepare(_):
+            raise IndexError("intentional _prepare failure")
+
+        producer_cls = self._isolated_producer_class(prepare)
+        items, producer = self._run_isolated_producer(producer_cls, 1, 1)
+        failure = items[0]
+        self.assertIsInstance(failure, ProducerFailure)
+        self.assertEqual(failure.kind, "IndexError")
+        self.assertIn("intentional _prepare failure", failure.message)
+        self.assertIn("Traceback", failure.traceback_text)
+        # The child reported the error and exited normally; the parent still has it.
+        self.assertEqual(producer._process.exitcode, 0)
+
+    def test_process_producer_failure_ordered_after_rounds(self):
+        def prepare(i):
+            if i == 0:
+                return PreparedRound(None, [], [], [])
+            raise IndexError("intentional failure after one round")
+
+        producer_cls = self._isolated_producer_class(prepare)
+        items, _ = self._run_isolated_producer(producer_cls, 2, 2)
+        self.assertIsInstance(items[0], PreparedRound)
+        self.assertIsInstance(items[1], ProducerFailure)
+        self.assertEqual(items[1].kind, "IndexError")
 
 
 if __name__ == '__main__':

@@ -43,6 +43,18 @@ class PreparedRound:
     boosted_seeds: tuple = ()
 
 
+@dataclass
+class ProducerFailure:
+    """Terminal message for a producer that failed after it started producing."""
+    kind: str
+    message: str
+    traceback_text: str
+
+    def to_exception(self) -> RuntimeError:
+        return RuntimeError(
+            f"round producer failed: {self.kind}: {self.message}\n{self.traceback_text}")
+
+
 def restore_prefetched_state(data_gen, prepared):
     """Restore confirmation RNG state and metadata lost by ndarray pickling."""
     if len(prepared.inputs) != len(prepared.input_seeds):
@@ -73,6 +85,7 @@ class RoundProducer(threading.Thread):
         self._queue = out_queue
         self._stop_event = stop_event
         self.error: Optional[BaseException] = None
+        self._error_traceback = ""
         self.produced = 0
         # Private RNG/model state; never touched by the main thread
         self._codegen = factory.get_program_generator(CONF.program_generator_seed, self._isa)
@@ -94,11 +107,20 @@ class RoundProducer(threading.Thread):
                 self.produced += 1
         except BaseException as e:  # propagate to the main thread
             self.error = e
+            self._error_traceback = traceback.format_exc()
         finally:
-            try:
-                self._queue.put(None, timeout=1)
-            except queue.Full:
-                pass
+            # The termination message shares the data queue with prepared rounds,
+            # so the consumer cannot observe the end marker before a failure.
+            termination = None
+            if self.error is not None:
+                termination = ProducerFailure(
+                    type(self.error).__name__, str(self.error), self._error_traceback)
+            while not self._stop_event.is_set():
+                try:
+                    self._queue.put(termination, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
 
     def _prepare(self, i: int) -> PreparedRound:
         import time
@@ -140,31 +162,13 @@ class ProcessRoundProducer:
                  asm_prefix: str, max_rounds: int,
                  out_queue: 'multiprocessing.Queue', stop_event: 'multiprocessing.Event') -> None:
         ctx = multiprocessing.get_context("fork")
-        self._error_queue: 'multiprocessing.Queue' = ctx.Queue(1)
         self._process = ctx.Process(
             target=_process_main,
             args=(instruction_set_path, bases, num_inputs, asm_prefix, max_rounds,
-                  out_queue, stop_event, self._error_queue),
+                  out_queue, stop_event),
             name="rvzr-round-producer", daemon=True)
-        self._error: Optional[BaseException] = None
+        self.error: Optional[BaseException] = None
         self.produced = 0
-
-    @property
-    def error(self) -> Optional[BaseException]:
-        """Return the child failure, if any, without losing its traceback."""
-        if self._error is None:
-            try:
-                payload = self._error_queue.get_nowait()
-            except queue.Empty:
-                payload = None
-            if payload is not None:
-                kind, message, traceback_text = payload
-                self._error = RuntimeError(
-                    f"round producer failed: {kind}: {message}\n{traceback_text}")
-            elif self._process.exitcode not in (None, 0):
-                self._error = RuntimeError(
-                    f"round producer exited with code {self._process.exitcode}")
-        return self._error
 
     def start(self) -> None:
         self._process.start()
@@ -180,7 +184,7 @@ class ProcessRoundProducer:
 
 
 def _process_main(instruction_set_path, bases, num_inputs, asm_prefix, max_rounds,
-                  out_queue, stop_event, error_queue) -> None:
+                  out_queue, stop_event) -> None:
     try:
         from .isa_spec import InstructionSet
         isa = InstructionSet(instruction_set_path, CONF.instruction_categories)
@@ -189,12 +193,8 @@ def _process_main(instruction_set_path, bases, num_inputs, asm_prefix, max_round
         producer.run()
     except BaseException as exc:
         traceback.print_exc()
+        failure = ProducerFailure(type(exc).__name__, str(exc), traceback.format_exc())
         try:
-            error_queue.put((type(exc).__name__, str(exc), traceback.format_exc()),
-                            timeout=1)
-        except Exception:
-            pass
-        try:
-            out_queue.put(None, timeout=1)
+            out_queue.put(failure, timeout=1)
         except Exception:
             pass
