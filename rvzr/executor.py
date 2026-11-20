@@ -29,6 +29,33 @@ if TYPE_CHECKING:
 KMOutputLine = Tuple[int, int, int, int, int, int]
 ReadingsArray = npt.NDArray[np.void]
 
+def _read_km_trace_direct() -> bytes:
+    """Read one complete measurement batch directly from sysfs (persistent I/O path)."""
+    path = '/sys/rvzr_executor/trace'
+    old_affinity = os.sched_getaffinity(0)
+    target = {CONF.executor_taskset}
+    changed = old_affinity != target
+    if changed:
+        os.sched_setaffinity(0, target)
+    try:
+        chunks = []
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            while True:
+                chunk = os.read(fd, 1 << 20)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if b'done' in chunk:
+                    break
+        finally:
+            os.close(fd)
+        return b''.join(chunks)
+    finally:
+        if changed:
+            os.sched_setaffinity(0, old_affinity)
+
+
 STAT = FuzzingStats()
 
 
@@ -149,9 +176,13 @@ def _read_trace(n_reps: int,
         while not reading_finished:
             # read the next batch of traces from the kernel module
             try:
-                output = subprocess.check_output(
-                    f"taskset -c {CONF.executor_taskset} cat /sys/rvzr_executor/trace", shell=True)
-            except subprocess.CalledProcessError as e:
+                if getattr(CONF, 'enable_direct_sysfs_read', False):
+                    output = _read_km_trace_direct()
+                else:
+                    output = subprocess.check_output(
+                        f"taskset -c {CONF.executor_taskset} cat /sys/rvzr_executor/trace",
+                        shell=True)
+            except (subprocess.CalledProcessError, OSError) as e:
                 # A transient NMI/SMI during a measurement makes the kernel module return EIO.
                 # The original code let this abort the whole campaign; treat it as a corrupted
                 # measurement so that Fuzzer._normal_stage can skip this test case.
@@ -312,21 +343,49 @@ class Executor(ABC):
         STAT.executor_reruns += n_reps * n_inputs
 
         # Transfer inputs to the kernel module
-        # TODO: that's a quick-and-dirty optimization to reduce the number of KM calls;
-        # it should be rewritten
-        input_sequence = inputs if n_reps % 5 != 0 or n_inputs >= 1000 else inputs * 5
-        save_input_sequence_as_rdbf(input_sequence, '/sys/rvzr_executor/inputs')
+        min_batch_reps = int(getattr(CONF, 'full_rep_batch_min_reps', 0) or 0)
+        if (getattr(CONF, 'enable_full_rep_batching', False)
+                and n_reps > 1 and n_reps >= min_batch_reps):
+            # Measure all repetitions in one kernel call.  The kernel executes the expanded
+            # input sequence in exactly the same order as the stock per-repetition calls, but
+            # pays the setup/flush/warm-up cost only once.
+            group = int(getattr(CONF, 'full_rep_batch_group', 0) or n_reps)
+            if group <= 0 or group > n_reps:
+                group = n_reps
+            all_readings = np.ndarray(shape=(n_inputs, n_reps), dtype=RawHTraceSample)
+            offset = 0
+            while offset < n_reps:
+                cur_reps = min(group, n_reps - offset)
+                expanded = list(inputs) * cur_reps
+                save_input_sequence_as_rdbf(expanded, '/sys/rvzr_executor/inputs')
+                with open('/sys/rvzr_executor/inputs', 'r') as f:
+                    if f.readline() != '1\n':
+                        raise IOError("Error writing inputs to the kernel module")
+                flat = np.ndarray(shape=(n_inputs * cur_reps,), dtype=RawHTraceSample)
+                for _, input_id, readings in \
+                        _read_trace(1, n_inputs * cur_reps,
+                                    arch_mode=self._enable_mismatch_check_mode):
+                    flat[input_id] = readings
+                for rep in range(cur_reps):
+                    for inp in range(n_inputs):
+                        all_readings[inp][offset + rep] = flat[rep * n_inputs + inp]
+                offset += cur_reps
+        else:
+            # TODO: that's a quick-and-dirty optimization to reduce the number of KM calls;
+            # it should be rewritten
+            input_sequence = inputs if n_reps % 5 != 0 or n_inputs >= 1000 else inputs * 5
+            save_input_sequence_as_rdbf(input_sequence, '/sys/rvzr_executor/inputs')
 
-        # Check that the transfer was successful
-        with open('/sys/rvzr_executor/inputs', 'r') as f:
-            if f.readline() != '1\n':
-                raise IOError("Error writing inputs to the kernel module")
+            # Check that the transfer was successful
+            with open('/sys/rvzr_executor/inputs', 'r') as f:
+                if f.readline() != '1\n':
+                    raise IOError("Error writing inputs to the kernel module")
 
-        # Call the kernel module and read traces
-        all_readings: ReadingsArray = np.ndarray(shape=(n_inputs, n_reps), dtype=RawHTraceSample)
-        for rep_id, input_id, readings in \
-                _read_trace(n_reps, n_inputs, arch_mode=self._enable_mismatch_check_mode):
-            all_readings[input_id][rep_id] = readings
+            # Call the kernel module and read traces
+            all_readings = np.ndarray(shape=(n_inputs, n_reps), dtype=RawHTraceSample)
+            for rep_id, input_id, readings in \
+                    _read_trace(n_reps, n_inputs, arch_mode=self._enable_mismatch_check_mode):
+                all_readings[input_id][rep_id] = readings
 
         # Post-process results and return a list of HTrace objects
         traces = self._raw_readings_to_traces(all_readings, n_inputs)

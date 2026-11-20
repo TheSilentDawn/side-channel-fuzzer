@@ -258,6 +258,16 @@ class Conf:
     executor_taskset: int = 0
     """ executor_taskset: id of the CPU core on which the executor is running test cases """
     enable_pre_run_flush: bool = True
+    enable_pipeline: bool = False
+    pipeline_use_process: bool = True
+    enable_direct_sysfs_read: bool = False
+    enable_full_rep_batching: bool = False
+    full_rep_batch_group: int = 0
+    """full_rep_batch_group: reps per expanded kernel call; 0 means one call for all reps"""
+    full_rep_batch_min_reps: int = 0
+    """full_rep_batch_min_reps: only batch calls with at least this many reps; 0 batches all"""
+    enable_forced_split: bool = False
+    """enable_forced_split: diagnostic unconditional 5+5 fast-path control."""
     enable_adaptive_sampling: bool = False
     """ enable_adaptive_sampling: use the SeqRev prefix sampling controller on the fast path """
     adaptive_initial_samples: int = 5

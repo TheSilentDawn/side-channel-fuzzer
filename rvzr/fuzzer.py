@@ -10,7 +10,12 @@ from __future__ import annotations
 
 import shutil
 import os
+import sys
+import json
+import time
 import tempfile
+import queue
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional, List, Callable, Literal, Final
@@ -37,6 +42,7 @@ if TYPE_CHECKING:
     from .elf_parser import ELFParser
     from .model import Model
     from .executor import Executor
+    from .pipeline import PreparedRound
 
 FuzzingMode = Literal["random", "template", "asm"]
 RoundStage = Literal["fast", "nesting", "taint_mistake", "priming", "noise", "arch_mismatch",
@@ -120,10 +126,13 @@ class _RoundManager:
     fuzzer: Final[Fuzzer]
     conf: Final[_RoundState]
 
-    def __init__(self, fuzzer: Fuzzer, test_case: TestCaseProgram, inputs: List[InputData]) -> None:
+    def __init__(self, fuzzer: Fuzzer, test_case: TestCaseProgram, inputs: List[InputData],
+                 prefetched: Optional['PreparedRound'] = None) -> None:
         self.test_case = test_case
         self.org_inputs = inputs
         self.boosted_inputs = []
+        self._prefetched = prefetched is not None
+        self._model_loaded = False
 
         self.htraces = []
         self.ctraces = []
@@ -133,7 +142,12 @@ class _RoundManager:
         self.fuzzer = fuzzer
         self.conf = _RoundState(fuzzer.model.is_speculative)
 
-        self.fuzzer.model.load_test_case(self.test_case)
+        if prefetched is not None:
+            self.boosted_inputs = prefetched.boosted_inputs
+            self.ctraces = prefetched.ctraces
+        else:
+            self.fuzzer.model.load_test_case(self.test_case)
+            self._model_loaded = True
         self.fuzzer.executor.load_test_case(self.test_case)
 
     def execute_stage(self, stage: RoundStage) -> None:
@@ -152,6 +166,8 @@ class _RoundManager:
 
         if stage == "nesting":
             if self.conf.model_nesting != self.conf.max_nesting:
+                self._prefetched = False
+                self._ensure_model_loaded()
                 self.conf.model_nesting = self.conf.max_nesting
                 self._normal_stage()
 
@@ -163,7 +179,8 @@ class _RoundManager:
 
         if stage == "taint_mistake":
             if self.conf.enable_fast_contract_tracing:  # applicable only after fast tracing
-
+                self._prefetched = False
+                self._ensure_model_loaded()
                 self.conf.enable_fast_contract_tracing = False
                 self._normal_stage()
 
@@ -203,6 +220,11 @@ class _RoundManager:
             self._check_for_architectural_mismatch()
             return
 
+    def _ensure_model_loaded(self) -> None:
+        if not self._model_loaded:
+            self.fuzzer.model.load_test_case(self.test_case)
+            self._model_loaded = True
+
     def finalize(self) -> None:
         """ Finalize the fuzzing round """
         self.fuzzer.log.dbg_dump_traces(self.boosted_inputs, self.htraces, self._reference_htraces,
@@ -228,6 +250,8 @@ class _RoundManager:
         Trace the test case with the original inputs, collect taints, and use them to
         generate boosted inputs
         """
+        if self._prefetched:
+            return
         # no need to taint track if we aren't going to boost
         if CONF.inputs_per_class == 1:
             self._non_boosted_ctraces = \
@@ -243,6 +267,8 @@ class _RoundManager:
 
     def _collect_ctraces(self) -> None:
         """ Collect contract traces for the boosted inputs """
+        if self._prefetched:
+            return
         # contract traces are already collected
         if self.conf.reuse_ctraces:
             assert len(self.ctraces) == len(self.boosted_inputs), "No ctraces to reuse"
@@ -259,7 +285,12 @@ class _RoundManager:
 
     def _collect_htraces(self) -> None:
         """ Collect hardware traces for the boosted inputs """
-        if (CONF.enable_adaptive_sampling and self.conf.is_initial
+        if (CONF.enable_forced_split and self.conf.is_initial
+                and not self.conf.extend_htraces and self.conf.executor_n_reps == 10):
+            low = self.fuzzer.executor.trace_test_case(self.boosted_inputs, 5)
+            high = self.fuzzer.executor.trace_test_case(self.boosted_inputs, 5)
+            new_htraces = [h.merge(x) for h, x in zip(low, high)]
+        elif (CONF.enable_adaptive_sampling and self.conf.is_initial
                 and not self.conf.extend_htraces
                 and self.conf.executor_n_reps > CONF.adaptive_initial_samples):
             from .measurement_controller import MeasurementController
@@ -485,6 +516,7 @@ class Fuzzer:
         self._existing_test_case = existing_test_case
         self._input_paths = input_paths if input_paths is not None else []
         self._work_dir = work_dir
+        self._instruction_set_path = instruction_set_spec
 
         # Create all main modules
         self.log = FuzzLogger()
@@ -522,57 +554,169 @@ class Fuzzer:
         # Find an appropriate generation function
         self._set_generation_function(type_)
 
-        # Start the fuzzing loop
-        for i in range(num_test_cases):
-            self.log.start_round(i)
-
-            # Generate a test case
-            test_case: TestCaseProgram = self._generation_function(self._existing_test_case)
-            STAT.test_cases += 1
-
-            # Prepare inputs
-            inputs: List[InputData]
-            if self._input_paths:
-                inputs = self.data_gen.load(self._input_paths)
+        use_pipeline = (CONF.enable_pipeline and type_ == "random"
+                        and not self._existing_test_case and not self._input_paths)
+        producer = None
+        prepared_queue = None
+        stop_event = None
+        if use_pipeline:
+            if CONF.pipeline_use_process:
+                import multiprocessing
+                from .pipeline import ProcessRoundProducer
+                ctx = multiprocessing.get_context("fork")
+                prepared_queue = ctx.Queue(maxsize=2)
+                stop_event = ctx.Event()
+                producer = ProcessRoundProducer(self._instruction_set_path,
+                                                self.executor.read_base_addresses(),
+                                                num_inputs,
+                                                os.path.join(self._work_dir, "pipeline"),
+                                                num_test_cases + 2, prepared_queue,
+                                                stop_event)
             else:
-                inputs = self.data_gen.generate(num_inputs, n_actors=test_case.n_actors())
-            STAT.num_inputs += len(inputs) * CONF.inputs_per_class
+                from .pipeline import RoundProducer
+                prepared_queue = queue.Queue(maxsize=2)
+                stop_event = threading.Event()
+                producer = RoundProducer(self._isa_spec, self.executor.read_base_addresses(),
+                                         num_inputs, os.path.join(self._work_dir, "pipeline"),
+                                         num_test_cases + 2, prepared_queue, stop_event)
+            producer.start()
 
-            # Check if the test case is useful
-            if self._filter(test_case, inputs):
-                continue
+        trace_path = os.environ.get("RVZR_PIPELINE_TRACE", "")
+        trace_file = open(trace_path, 'a', buffering=1) if trace_path and producer is not None else None
+        trace_prev_round = None
 
-            # Fuzz the test case
-            try:
-                violation = self.fuzzing_round(test_case, inputs, [])
-            except OSError as e:
-                # The executor can reject a malformed/unsupported test case with EIO, or a
-                # transient NMI can corrupt a measurement. Skip this test case instead of
-                # aborting the whole campaign.
-                warning("fuzzer", f"Skipping test case after executor error: {e}")
-                continue
-            if violation:
-                self.log.report_violations(violation)
-                self.log.dbg_violation(violation, self.model)
-                if save_violations:
-                    self._store_violation_artifact(violation, self._work_dir)
-                STAT.violations += 1
-                if not nonstop:
-                    break
+        def _trace(event: str, **fields) -> None:
+            if trace_file is None:
+                return
+            trace_file.write(json.dumps({'event': event, 't': time.perf_counter(), **fields}) + '\n')
 
-            # Terminate the fuzzer if the timeout has expired
-            if timeout:
-                now = datetime.today()
-                if (now - start_time).total_seconds() > timeout:
+        if producer is not None:
+            pid = getattr(getattr(producer, '_process', None), 'pid', None) or \
+                getattr(producer, 'ident', None)
+            _trace('producer_start', producer_pid=pid, use_process=CONF.pipeline_use_process)
+
+        _dbg = os.environ.get("RVZR_PIPELINE_DEBUG", "")
+        campaign_deadline = float(os.environ.get("RVZR_CAMPAIGN_DEADLINE", "inf"))
+        try:
+            # Start the fuzzing loop
+            for i in range(num_test_cases):
+                if time.perf_counter() >= campaign_deadline:
                     self.log.timeout()
                     break
+                self.log.start_round(i)
+
+                _wait = 0.0
+                if producer is not None:
+                    _tget = time.perf_counter()
+                    try:
+                        prepared = prepared_queue.get(timeout=120)  # type: ignore[union-attr]
+                    except queue.Empty:
+                        if producer.error:
+                            raise producer.error
+                        raise RuntimeError("round producer stalled")
+                    _wait = (time.perf_counter() - _tget) * 1000
+                    if prepared is None:
+                        if producer.error:
+                            raise producer.error
+                        raise RuntimeError("round producer ended before requested case count")
+                    test_case = prepared.test_case
+                    inputs = prepared.inputs
+                    prefetched = prepared
+                    # Confirmation must re-boost from this round's RNG state,
+                    # matching the synchronous generator. The producer owns a
+                    # separate generator and may already be several rounds ahead.
+                    from .pipeline import restore_prefetched_state
+                    restore_prefetched_state(self.data_gen, prepared)
+                else:
+                    test_case = self._generation_function(self._existing_test_case)
+                    if self._input_paths:
+                        inputs = self.data_gen.load(self._input_paths)
+                    else:
+                        inputs = self.data_gen.generate(num_inputs,
+                                                        n_actors=test_case.n_actors())
+                    prefetched = None
+                STAT.test_cases += 1
+                STAT.num_inputs += len(inputs) * CONF.inputs_per_class
+
+                # Check if the test case is useful
+                if self._filter(test_case, inputs):
+                    continue
+
+                # Fuzz the test case
+                _tround = time.perf_counter()
+                try:
+                    violation = self.fuzzing_round(test_case, inputs, [], prefetched)
+                except OSError as e:
+                    # The executor can reject a malformed/unsupported test case with EIO, or a
+                    # transient NMI can corrupt a measurement. Skip this test case instead of
+                    # aborting the whole campaign.
+                    warning("fuzzer", f"Skipping test case after executor error: {e}")
+                    continue
+                _round_end = time.perf_counter()
+                if trace_file is not None and prefetched is not None:
+                    overlap = False
+                    if trace_prev_round is not None:
+                        overlap = (prefetched.prepared_start_s <= trace_prev_round['round_end_s']
+                                   and prefetched.prepared_end_s >= trace_prev_round['round_start_s'])
+                    _trace('round', round=i,
+                           prepared_start_s=prefetched.prepared_start_s,
+                           prepared_end_s=prefetched.prepared_end_s,
+                           producer_pid=prefetched.producer_pid,
+                           round_start_s=_tround, round_end_s=_round_end,
+                           queue_wait_ms=_wait,
+                           generation_ms=prefetched.generation_ms,
+                           model_ms=prefetched.model_ms,
+                           overlaps_previous_round=overlap)
+                    trace_prev_round = {'round_start_s': _tround, 'round_end_s': _round_end}
+                if _dbg:
+                    print(f"PIPE round={i} wait_ms={_wait:.1f} round_ms={(time.perf_counter()-_tround)*1000:.1f}",
+                          file=sys.stderr, flush=True)
+                if violation:
+                    self.log.report_violations(violation)
+                    self.log.dbg_violation(violation, self.model)
+                    if save_violations:
+                        self._store_violation_artifact(violation, self._work_dir)
+                    STAT.violations += 1
+                    if not nonstop:
+                        break
+
+                # Terminate the fuzzer if the timeout has expired
+                if timeout:
+                    now = datetime.today()
+                    if (now - start_time).total_seconds() > timeout:
+                        self.log.timeout()
+                        break
+        finally:
+            if stop_event is not None:
+                stop_event.set()
+            if producer is not None:
+                # Drain prefetched rounds so the producer's queue feeder can finish.
+                if prepared_queue is not None:
+                    try:
+                        while not prepared_queue.empty():
+                            prepared_queue.get_nowait()
+                    except Exception:
+                        pass
+                _tj = time.perf_counter()
+                producer.join(timeout=0.2)
+                if producer is not None:
+                    _trace('producer_end', join_ms=(time.perf_counter() - _tj) * 1000,
+                           alive=bool(getattr(getattr(producer, '_process', None),
+                                             'is_alive', lambda: False)()))
+                if _dbg:
+                    print(f"PIPE join_ms={(time.perf_counter()-_tj)*1000:.1f} "
+                          f"alive={getattr(getattr(producer, '_process', None), 'is_alive', lambda: False)()}",
+                          file=sys.stderr, flush=True)
+        if trace_file is not None:
+            trace_file.close()
 
         self.log.finish()
         self.log.report_model_coverage(self.model)
         return STAT.violations > 0
 
     def fuzzing_round(self, test_case: TestCaseProgram, inputs: List[InputData],
-                      starting_ignore_list: List[int]) -> Optional[Violation]:
+                      starting_ignore_list: List[int],
+                      prefetched: Optional['PreparedRound'] = None) -> Optional[Violation]:
         """
         Run a single fuzzing round: collect contract and hardware traces for the given test
         case and inputs, and check for contract violations.
@@ -593,7 +737,7 @@ class Fuzzer:
         # pylint: disable=too-many-return-statements
 
         # Initialize the round manager and load the test case
-        round_manager = _RoundManager(self, test_case, inputs)
+        round_manager = _RoundManager(self, test_case, inputs, prefetched)
 
         # If a list of ignored inputs is provided, set it in the executor
         if starting_ignore_list:
