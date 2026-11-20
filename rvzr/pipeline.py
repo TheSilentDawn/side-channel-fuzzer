@@ -182,6 +182,14 @@ class ProcessRoundProducer:
             self._process.terminate()
             self._process.join(0.5)
 
+    def failure_if_exited(self) -> Optional[BaseException]:
+        """Report an exit that happened without a termination message."""
+        code = self._process.exitcode
+        if code is None:
+            return None
+        return RuntimeError(
+            f"round producer exited with code {code} before sending a termination message")
+
 
 def _process_main(instruction_set_path, bases, num_inputs, asm_prefix, max_rounds,
                   out_queue, stop_event) -> None:

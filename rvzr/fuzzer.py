@@ -475,6 +475,34 @@ class _RoundManager:
 # ==================================================================================================
 # Public: Fuzzer
 # ==================================================================================================
+def _raise_if_producer_failed(producer) -> None:
+    if producer.error:
+        raise producer.error
+    check_exit = getattr(producer, "failure_if_exited", None)
+    if check_exit is not None:
+        failure = check_exit()
+        if failure is not None:
+            raise failure
+
+
+def _get_prepared_round(prepared_queue, producer, timeout: float = 120.0):
+    """Wait for a prepared round or a termination message.
+
+    The wait is split into short polls so a producer that exits without sending
+    a termination message is reported promptly, not after the full timeout.
+    """
+    deadline = time.perf_counter() + timeout
+    while True:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            _raise_if_producer_failed(producer)
+            raise RuntimeError("round producer stalled")
+        try:
+            return prepared_queue.get(timeout=min(1.0, remaining))
+        except queue.Empty:
+            _raise_if_producer_failed(producer)
+
+
 class Fuzzer:
     """
     The main class that orchestrates the fuzzing process. It creates all necessary modules
@@ -609,12 +637,7 @@ class Fuzzer:
                 _wait = 0.0
                 if producer is not None:
                     _tget = time.perf_counter()
-                    try:
-                        prepared = prepared_queue.get(timeout=120)  # type: ignore[union-attr]
-                    except queue.Empty:
-                        if producer.error:
-                            raise producer.error
-                        raise RuntimeError("round producer stalled")
+                    prepared = _get_prepared_round(prepared_queue, producer)
                     _wait = (time.perf_counter() - _tget) * 1000
                     if isinstance(prepared, ProducerFailure):
                         raise prepared.to_exception()

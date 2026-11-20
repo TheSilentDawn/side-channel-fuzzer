@@ -1,6 +1,8 @@
 """Correctness checks for combined sampling, metadata transfer and confirmation."""
 import multiprocessing
+import os
 import pickle
+import queue
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -8,7 +10,7 @@ import numpy as np
 
 from rvzr.config import CONF
 from rvzr.data_generator import DataGenerator
-from rvzr.fuzzer import _RoundManager
+from rvzr.fuzzer import _RoundManager, _get_prepared_round
 from rvzr import pipeline as pipeline_module
 from rvzr.pipeline import PreparedRound, ProducerFailure, restore_prefetched_state
 from rvzr.tc_components.test_case_data import InputTaint
@@ -156,6 +158,45 @@ class IntegratedTests(unittest.TestCase):
         self.assertIsInstance(items[0], PreparedRound)
         self.assertIsInstance(items[1], ProducerFailure)
         self.assertEqual(items[1].kind, "IndexError")
+
+    def test_wait_for_producer_reads_exit_code(self):
+        class EmptyQueue:
+            def get(self, timeout):
+                raise queue.Empty
+
+        class ExitedProducer:
+            error = None
+
+            def failure_if_exited(self):
+                return RuntimeError(
+                    "round producer exited with code 7 before sending a termination message")
+
+        with self.assertRaises(RuntimeError) as raised:
+            _get_prepared_round(EmptyQueue(), ExitedProducer(), timeout=0.01)
+        self.assertIn("code 7", str(raised.exception))
+
+    def test_process_producer_reports_exit_without_message(self):
+        def prepare(_):
+            os._exit(7)
+
+        producer_cls = self._isolated_producer_class(prepare)
+        original = pipeline_module.RoundProducer
+        pipeline_module.RoundProducer = producer_cls
+        ctx = multiprocessing.get_context("fork")
+        out_queue = ctx.Queue(maxsize=2)
+        stop_event = ctx.Event()
+        producer = pipeline_module.ProcessRoundProducer(
+            str(Path(__file__).parent / "x86_tests" / "min_x86.json"),
+            (0, 0, 0, 0), 1, "/tmp/unused-prefix", 1, out_queue, stop_event)
+        try:
+            producer.start()
+            producer.join(timeout=5)
+            failure = producer.failure_if_exited()
+            self.assertIsNotNone(failure)
+            self.assertIn("code 7", str(failure))
+            self.assertEqual(producer._process.exitcode, 7)
+        finally:
+            pipeline_module.RoundProducer = original
 
 
 if __name__ == '__main__':
