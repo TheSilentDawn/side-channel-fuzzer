@@ -12,9 +12,10 @@ import os
 from pathlib import Path
 from copy import deepcopy
 
-from rvzr.arch.x86.generator import X86Generator, _X86Printer, _X86PatchUndefinedFlagsPass
+from rvzr.arch.x86.generator import X86Generator, _X86Printer, _X86PatchUndefinedFlagsPass, \
+    _X86PatchOpcodesPass
 from rvzr.arch.x86.target_desc import X86TargetDesc
-from rvzr.elf_parser import ELFParser
+from rvzr.elf_parser import ELFParser, _ParsingError
 from rvzr.factory import get_program_generator, get_asm_parser
 from rvzr.isa_spec import InstructionSet
 from rvzr.tc_components.actor import ActorMode
@@ -190,6 +191,42 @@ class X86GeneratorTest(unittest.TestCase):
         insts = list(bb0)
         self.assertEqual(insts[0].name, "macro")
         self.assertEqual(insts[1].name, "opcode")
+
+    @staticmethod
+    def _opcode_test_asm(seq: str) -> str:
+        return f"""
+.intel_syntax noprefix
+.section .data.main
+.byte {seq}
+lea si, qword ptr [rdx]
+movzx ecx, al
+nop
+.test_case_exit:
+"""
+
+    def test_x86_undefined_opcode_boundaries(self) -> None:
+        """Every emitted .byte sequence must decode as exactly one instruction."""
+        for options in _X86PatchOpcodesPass._OPCODES.values():
+            for seq in options:
+                tc = self.load_tc(self._opcode_test_asm(seq))
+                insts = [inst for section in tc.get_sections() for func in section
+                         for bb in list(func) + [func.get_exit_bb()]
+                         for inst in list(bb) + bb.terminators]
+                opcode = next(inst for inst in insts if inst.name == "opcode")
+                lea = next(inst for inst in insts if inst.name == "lea")
+                movzx = next(inst for inst in insts if inst.name == "movzx")
+                byte_count = len([x for x in seq.split(",") if x.strip()])
+                self.assertEqual(opcode.size(), byte_count, seq)
+                self.assertEqual(lea.section_offset(),
+                                 opcode.section_offset() + byte_count, seq)
+                self.assertEqual(movzx.section_offset(),
+                                 lea.section_offset() + lea.size(), seq)
+
+    def test_x86_unsafe_opcode_reports_parsing_error(self) -> None:
+        """A non-self-contained .byte sequence must not raise IndexError."""
+        asm = self._opcode_test_asm("0xd5, 0x90")
+        with self.assertRaises(_ParsingError):
+            self.load_tc(asm)
 
     def test_x86_asm_parsing_section(self) -> None:
         prev_actors = deepcopy(CONF.get_actors_conf())

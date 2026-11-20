@@ -904,30 +904,30 @@ class _X86PatchOpcodesPass(Pass):
     _OPCODES: Final[Dict[str, List[str]]] = {
         "ud2": [
             "0x0f, 0x0b",  # UD2 instruction
-            # invalid in 64-bit mode;
-            # all the following opcodes are padded
-            # with NOP to prevent misinterpretation by objdump
-            "0x06, 0x90",  # 32-bit encoding of PUSH
-            "0x07, 0x90",  # 32-bit encoding of POP
-            "0x0e, 0x90",  # alternative 32-bit encoding of PUSH
-            "0x16, 0x90",  # alternative 32-bit encoding of PUSH
-            "0x17, 0x90",  # alternative 32-bit encoding of POP
-            "0x1e, 0x90",  # alternative 32-bit encoding of PUSH
-            "0x1f, 0x90",  # alternative 32-bit encoding of POP
-            "0x27, 0x90",  # DAA
-            "0x2f, 0x90",  # DAS
-            "0x37, 0x90",  # AAA
-            "0x3f, 0x90",  # AAS
-            "0x60, 0x90",  # PUSHA
-            "0x61, 0x90",  # POPA
-            "0x62, 0x90",  # BOUND
-            "0x82, 0x90",  # 32-bit aliases for logical instructions
-            "0x9a, 0x90",  # 32-bit encoding of CALLF
-            "0xc4, 0x90",  # LES
-            "0xd4, 0x90",  # AAM
-            "0xd5, 0x90",  # AAD
-            "0xd6, 0x90",  # reserved
-            "0xea, 0x90",  # 32-bit encoding of JMPF
+            # Invalid in 64-bit mode. Each sequence must decode as exactly one
+            # instruction in objdump. Do not append a NOP: objdump counts the
+            # NOP as a second instruction, which desynchronizes the ELF
+            # instruction-address map. 0x62 (BOUND/EVEX) and 0xd5 (AAD) are
+            # omitted because even a single byte consumes following bytes.
+            "0x06",  # 32-bit encoding of PUSH
+            "0x07",  # 32-bit encoding of POP
+            "0x0e",  # alternative 32-bit encoding of PUSH
+            "0x16",  # alternative 32-bit encoding of PUSH
+            "0x17",  # alternative 32-bit encoding of POP
+            "0x1e",  # alternative 32-bit encoding of PUSH
+            "0x1f",  # alternative 32-bit encoding of POP
+            "0x27",  # DAA
+            "0x2f",  # DAS
+            "0x37",  # AAA
+            "0x3f",  # AAS
+            "0x60",  # PUSHA
+            "0x61",  # POPA
+            "0x82",  # 32-bit aliases for logical instructions
+            "0x9a",  # 32-bit encoding of CALLF
+            "0xc4",  # LES
+            "0xd4",  # AAM
+            "0xd6",  # reserved
+            "0xea",  # 32-bit encoding of JMPF
         ],
         "int1": ["0xf1"]
     }

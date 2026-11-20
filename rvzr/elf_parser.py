@@ -279,8 +279,14 @@ class ELFParser:
             for func_data in sorted_functions:
                 function_object = test_case_code.find_function(func_data["name"])
                 assert function_object.get_owner() == section_obj.owner
-                assert func_data["offset"] == instr_addr_map[section_data["name"]][cursor], \
-                    f"offsets: {func_data['offset']} {instr_addr_map[section_data['name']][cursor]}"
+                section_addresses = instr_addr_map[section_data["name"]]
+                if cursor >= len(section_addresses):
+                    raise _ParsingError(
+                        f"section '{section_data['name']}' has {len(section_addresses)} "
+                        f"instructions, but function '{func_data['name']}' starts at "
+                        f"cursor {cursor}")
+                assert func_data["offset"] == section_addresses[cursor], \
+                    f"offsets: {func_data['offset']} {section_addresses[cursor]}"
 
                 for bb in list(function_object) + [function_object.get_exit_bb()]:
                     for inst in list(bb) + bb.terminators:
@@ -328,6 +334,11 @@ class ELFParser:
         section_name = section_data["name"]
         instr_addr_map_in_sec = instr_addr_map[section_name]
 
+        if cursor >= len(instr_addr_map_in_sec):
+            raise _ParsingError(
+                f"section '{section_name}' has {len(instr_addr_map_in_sec)} instructions, "
+                f"but instruction '{inst.name}' is at cursor {cursor}")
+
         # get instruction info
         address = instr_addr_map_in_sec[cursor]
         if cursor + 1 < len(instr_addr_map_in_sec):
@@ -345,6 +356,11 @@ class ELFParser:
         # make it look like it does by adding NOPs to the instruction map
         if inst.name == "macro":
             for i in range(1, self._instruction_per_macro):
+                if cursor + i >= len(instr_addr_map_in_sec):
+                    raise _ParsingError(
+                        f"section '{section_name}' has {len(instr_addr_map_in_sec)} "
+                        f"instructions, but macro '{inst.name}' at cursor {cursor} "
+                        f"needs placeholder {i}")
                 address = instr_addr_map_in_sec[cursor + i]
                 nop_placeholder = Instruction("nop", "BASE-NOP")
                 nop_placeholder.is_macro_placeholder = True
