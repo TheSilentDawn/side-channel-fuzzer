@@ -164,6 +164,9 @@ class IntegratedTests(unittest.TestCase):
             def get(self, timeout):
                 raise queue.Empty
 
+            def get_nowait(self):
+                raise queue.Empty
+
         class ExitedProducer:
             error = None
 
@@ -174,6 +177,26 @@ class IntegratedTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as raised:
             _get_prepared_round(EmptyQueue(), ExitedProducer(), timeout=0.01)
         self.assertIn("code 7", str(raised.exception))
+
+    def test_wait_prefers_queued_failure_over_exit_code(self):
+        failure = ProducerFailure("ValueError", "original error", "traceback")
+
+        class EmptyThenMessageQueue:
+            def get(self, timeout):
+                raise queue.Empty
+
+            def get_nowait(self):
+                return failure
+
+        class ExitedProducer:
+            error = None
+
+            def failure_if_exited(self):
+                return RuntimeError(
+                    "round producer exited with code 0 before sending a termination message")
+
+        message = _get_prepared_round(EmptyThenMessageQueue(), ExitedProducer(), timeout=0.01)
+        self.assertIs(message, failure)
 
     def test_process_producer_reports_exit_without_message(self):
         def prepare(_):

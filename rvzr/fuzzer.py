@@ -475,14 +475,18 @@ class _RoundManager:
 # ==================================================================================================
 # Public: Fuzzer
 # ==================================================================================================
-def _raise_if_producer_failed(producer) -> None:
-    if producer.error:
-        raise producer.error
+def _queued_message_after_exit(prepared_queue, producer):
+    """Prefer a message already queued after a producer exit over the exit code."""
     check_exit = getattr(producer, "failure_if_exited", None)
-    if check_exit is not None:
-        failure = check_exit()
-        if failure is not None:
-            raise failure
+    if check_exit is None:
+        return False, None
+    failure = check_exit()
+    if failure is None:
+        return False, None
+    try:
+        return True, prepared_queue.get_nowait()
+    except queue.Empty:
+        raise failure
 
 
 def _get_prepared_round(prepared_queue, producer, timeout: float = 120.0):
@@ -490,17 +494,27 @@ def _get_prepared_round(prepared_queue, producer, timeout: float = 120.0):
 
     The wait is split into short polls so a producer that exits without sending
     a termination message is reported promptly, not after the full timeout.
+    After an exit, one non-blocking queue read lets an already-delivered message
+    win over the exit code.
     """
     deadline = time.perf_counter() + timeout
     while True:
         remaining = deadline - time.perf_counter()
         if remaining <= 0:
-            _raise_if_producer_failed(producer)
+            has_message, message = _queued_message_after_exit(prepared_queue, producer)
+            if has_message:
+                return message
+            if producer.error:
+                raise producer.error
             raise RuntimeError("round producer stalled")
         try:
             return prepared_queue.get(timeout=min(1.0, remaining))
         except queue.Empty:
-            _raise_if_producer_failed(producer)
+            has_message, message = _queued_message_after_exit(prepared_queue, producer)
+            if has_message:
+                return message
+            if producer.error:
+                raise producer.error
 
 
 class Fuzzer:
