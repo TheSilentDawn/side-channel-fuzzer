@@ -1,5 +1,7 @@
 """Correctness checks for combined sampling, metadata transfer and confirmation."""
+import multiprocessing
 import pickle
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 import numpy as np
@@ -7,6 +9,7 @@ import numpy as np
 from rvzr.config import CONF
 from rvzr.data_generator import DataGenerator
 from rvzr.fuzzer import _RoundManager
+from rvzr import pipeline as pipeline_module
 from rvzr.pipeline import PreparedRound, restore_prefetched_state
 from rvzr.tc_components.test_case_data import InputTaint
 from rvzr.traces import HTrace, RawHTraceSample
@@ -92,6 +95,32 @@ class IntegratedTests(unittest.TestCase):
             self.assertEqual(manager.htraces[0].sample_size(), 12)
         finally:
             CONF.enable_forced_split = old
+
+    def test_process_producer_propagates_child_exception(self):
+        class FailingRoundProducer:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run(self):
+                raise IndexError("intentional child failure")
+
+        original = pipeline_module.RoundProducer
+        pipeline_module.RoundProducer = FailingRoundProducer
+        ctx = multiprocessing.get_context("fork")
+        out_queue = ctx.Queue(maxsize=2)
+        stop_event = ctx.Event()
+        producer = pipeline_module.ProcessRoundProducer(
+            str(Path(__file__).parent / "x86_tests" / "min_x86.json"),
+            (0, 0, 0, 0), 1, "/tmp/unused-prefix", 1, out_queue, stop_event)
+        try:
+            producer.start()
+            producer.join(timeout=5)
+            error = producer.error
+            self.assertIsNotNone(error)
+            self.assertIn("IndexError", str(error))
+            self.assertIn("intentional child failure", str(error))
+        finally:
+            pipeline_module.RoundProducer = original
 
 
 if __name__ == '__main__':

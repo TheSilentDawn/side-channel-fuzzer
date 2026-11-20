@@ -140,13 +140,31 @@ class ProcessRoundProducer:
                  asm_prefix: str, max_rounds: int,
                  out_queue: 'multiprocessing.Queue', stop_event: 'multiprocessing.Event') -> None:
         ctx = multiprocessing.get_context("fork")
+        self._error_queue: 'multiprocessing.Queue' = ctx.Queue(1)
         self._process = ctx.Process(
             target=_process_main,
             args=(instruction_set_path, bases, num_inputs, asm_prefix, max_rounds,
-                  out_queue, stop_event),
+                  out_queue, stop_event, self._error_queue),
             name="rvzr-round-producer", daemon=True)
-        self.error: Optional[str] = None
+        self._error: Optional[BaseException] = None
         self.produced = 0
+
+    @property
+    def error(self) -> Optional[BaseException]:
+        """Return the child failure, if any, without losing its traceback."""
+        if self._error is None:
+            try:
+                payload = self._error_queue.get_nowait()
+            except queue.Empty:
+                payload = None
+            if payload is not None:
+                kind, message, traceback_text = payload
+                self._error = RuntimeError(
+                    f"round producer failed: {kind}: {message}\n{traceback_text}")
+            elif self._process.exitcode not in (None, 0):
+                self._error = RuntimeError(
+                    f"round producer exited with code {self._process.exitcode}")
+        return self._error
 
     def start(self) -> None:
         self._process.start()
@@ -162,15 +180,20 @@ class ProcessRoundProducer:
 
 
 def _process_main(instruction_set_path, bases, num_inputs, asm_prefix, max_rounds,
-                  out_queue, stop_event) -> None:
+                  out_queue, stop_event, error_queue) -> None:
     try:
         from .isa_spec import InstructionSet
         isa = InstructionSet(instruction_set_path, CONF.instruction_categories)
         producer = RoundProducer(isa, bases, num_inputs, asm_prefix, max_rounds,
                                  out_queue, stop_event)
         producer.run()
-    except BaseException:
+    except BaseException as exc:
         traceback.print_exc()
+        try:
+            error_queue.put((type(exc).__name__, str(exc), traceback.format_exc()),
+                            timeout=1)
+        except Exception:
+            pass
         try:
             out_queue.put(None, timeout=1)
         except Exception:
